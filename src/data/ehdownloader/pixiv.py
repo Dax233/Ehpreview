@@ -24,6 +24,8 @@ def download_images(url, save_dir, cookies):
     }
     api_url = f'https://www.pixiv.net/ajax/illust/{artwork_id}/pages'
     response = requests.get(api_url, headers=headers)
+    if response.status_code != 200:
+        return f"无法访问该链接，状态码: {response.status_code}"
     response.raise_for_status()
     data = response.json()
 
