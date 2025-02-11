@@ -188,6 +188,9 @@ async def handle_group_message(bot: Bot, event: Event):
         url = extract_url(message)
         for i in e_keyword:
             if i.match(url):
+                # 检测并替换 URL 中的 e-hentai 为 exhentai
+                if "e-hentai" in url:
+                    url = url.replace("e-hentai", "exhentai")
                 eurl = True
                 if url in data:
                     isExist = True
