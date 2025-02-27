@@ -11,8 +11,10 @@ TITLE_RE = re.compile(r'<h1 id="gn">(.*?)</h1>')
 @retry(stop_max_attempt_number=10, wait_fixed=500)
 def fetch_url(url, headers, session):
     response = session.get(url, headers=headers)
+    if response.status_code != 200:
+        return "!200" ,f"无法访问该链接，状态码: {response.status_code}"
     response.raise_for_status()
-    return response.text
+    return response.text, None
 
 def download_images(url, save_dir, cookies):
     headers = {
@@ -20,7 +22,9 @@ def download_images(url, save_dir, cookies):
         'Cookie': cookies
     }
     session = requests.Session()
-    content = fetch_url(url, headers, session)
+    content, error = fetch_url(url, headers, session)
+    if content == '!200':
+        return error
     soup = BeautifulSoup(content, 'html.parser')
 
     title_match = TITLE_RE.search(content)
@@ -43,7 +47,7 @@ def download_images(url, save_dir, cookies):
     for index, page_link in enumerate(image_page_links):
         print(f"Processing page link: {page_link}")
         try:
-            page_content = fetch_url(page_link, headers, session)
+            page_content, error = fetch_url(page_link, headers, session)
             img_match = IMG_RE.search(page_content)
             if img_match:
                 img_url = img_match.group(1)
