@@ -25,7 +25,7 @@ PIXIV_RE = re.compile(r'https://www\.pixiv\.net/artworks/\d+')
 
 json_path = current_dir + '/cache/data.json'
 
-def add_watermark(image_path, watermark_text="刻上属于你的痕迹", font_path="src/fonts/lolita.ttf"):
+def add_watermark(image_path, watermark_text=f"刻上属于你的痕迹 {time.localtime}", font_path="src/fonts/lolita.ttf"):
     base = Image.open(image_path).convert('RGBA')
     width, height = base.size
 
@@ -49,13 +49,14 @@ def add_watermark(image_path, watermark_text="刻上属于你的痕迹", font_pa
 
     # Save the result
     parts = image_path.split('.')
-    if parts[1] == 'jpeg' or parts[1] == 'jpg':
+    if parts[1] == 'jpeg' or parts[1] == 'jpg' or parts[1] == 'webp':
         new_path = parts[0] + '.png'
         watermarked.save(new_path)
         os.remove(image_path)
+        image_path = new_path
     else:
         watermarked.save(image_path)
-    return new_path
+    return image_path
 
 def download_images(url, save_dir):
     if EHENTAI_RE.match(url):
@@ -123,7 +124,7 @@ for key, value in data.items():
             save_json(data)
 data = load_json()
 sorted_keys = sorted(data.keys(), key=lambda k: int(data[k]['file_path']) if k != 'mod' and isinstance(data[k], dict) else 0, reverse=True)
-for key in sorted_keys[30:]:
+for key in sorted_keys[10:]:
     data = load_json()
     if key != 'mod' and isinstance(data[key], dict):
         folder_path = current_dir + '/cache/' + data[key]['file_path']
