@@ -5,6 +5,7 @@ import re
 import random
 
 NHAPI = "https://nhapi.cat42.uk/gallery/"
+NHOAPI = 'https://nhentai.net/api/gallery/'
 NH_CDN_LIST = [
     "https://i1.nhentai.net/galleries",
     "https://i2.nhentai.net/galleries",
@@ -26,6 +27,11 @@ def download_images(url, save_dir, cookies):
         'Cookie': cookies
     }
     session = requests.Session()
+    proxies = {
+        "http": "http://127.0.0.1:7890",
+        "https": "https://127.0.0.1:7890"
+    }
+    session.proxies.update(proxies)
     
     # Normalize URL
     parts = url.strip('/').split('/')
@@ -34,11 +40,16 @@ def download_images(url, save_dir, cookies):
     
     album_id = parts[4]
     api_url = f"{NHAPI}{album_id}"
+    o_api_url = f"{NHOAPI}{album_id}"
     original_url = f"https://nhentai.net/g/{album_id}"
     print(f"[nhentai] process {api_url} (original URL {original_url})")
 
     # Fetch album data
     album, error = fetch_url(api_url, headers, session)
+    if error == "无法访问该链接，状态码: 404":
+        print(f"[nhentai] process {o_api_url} (original URL {original_url})")
+        # Fetch album data
+        album, error = fetch_url(o_api_url, headers, session)
     if album == '!200':
         return error
     title = album['title'].get('pretty') or album['title'].get('english') or album['title'].get('japanese') or f"nhentai-{album_id}"
