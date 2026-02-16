@@ -1,4 +1,4 @@
-# I:/github/DaY-Core/plugins_human/eh_preview/scrapers.py (神之启示・最终实装版)
+# I:/github/DaY-Core/plugins_human/eh_preview/scrapers.py
 import asyncio
 import re
 from typing import Any, ClassVar, NamedTuple
@@ -18,12 +18,14 @@ class ScrapeResult(NamedTuple):
         author (str | None): 画廊作者，可能为 None.
         description (str | None): 画廊描述，可能为 None.
         image_urls (list[str]): 图片链接列表.
+        download_headers (dict | None): 下载图片时可能需要的额外请求头.
     """
 
     title: str
     author: str | None
     description: str | None
     image_urls: list[str]
+    download_headers: dict | None = None  # <-- 1. 在这里增加一个字段
 
 
 EHENTAI_RE = re.compile(r"https?://e-hentai\.org/g/\d+/[\w-]+")
@@ -189,9 +191,9 @@ class Scraper:
         # 3. 用“圣印”和页面信息，自己拼接出每一张图片的真实URL
         image_urls = []
         for i, page in enumerate(data["images"]["pages"]):
-            ext = {"j": "jpg", "p": "png", "g": "gif"}.get(page["t"], "jpg")
+            ext = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}.get(page["t"], "jpg")
             # 使用 i.nhentai.net 作为图片服务器域名
-            image_urls.append(f"https://i.nhentai.net/galleries/{media_id}/{i + 1}.{ext}")
+            image_urls.append(f"https://i4.nhentai.net/galleries/{media_id}/{i + 1}.{ext}")
 
         logger.success(f"通过API成功获取到 {len(image_urls)} 张图片链接！")
         return ScrapeResult(title=title, author=None, description=None, image_urls=image_urls)
@@ -234,6 +236,12 @@ class Scraper:
         desc_html = body.get("description", "")
         description = BeautifulSoup(desc_html, "html.parser").get_text("\n")
         image_urls = [page["urls"]["original"] for page in pages_data["body"]]
+        
+        # --- 2. 在这里返回结果时，附加上下载图片所需的 Referer 头 ---
         return ScrapeResult(
-            title=title, author=author, description=description, image_urls=image_urls
+            title=title,
+            author=author,
+            description=description,
+            image_urls=image_urls,
+            download_headers={"Referer": "https://www.pixiv.net/"},
         )
