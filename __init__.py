@@ -258,6 +258,7 @@ async def download_gallery(adapter: Adapter, task_info: DownloadTask) -> None:
     task_info.task.set_name(f"Downloader-{task_info.url[:30]}")
     logger.info(f"开始下载: {task_info.url}")
 
+    scrape_result = None  # 在 try 外部初始化
     try:
         matched_pattern = next(p for p in Scraper.SCRAPER_MAPPING if p.match(task_info.url))
         scraper_func_name = Scraper.SCRAPER_MAPPING[matched_pattern]
@@ -272,8 +273,9 @@ async def download_gallery(adapter: Adapter, task_info: DownloadTask) -> None:
         )
         download_dir.mkdir(parents=True, exist_ok=True)
 
+        # 将 scraper 返回的专属请求头传递给下载函数
         image_tasks = [
-            download_image(url, download_dir, index)
+            download_image(url, download_dir, index, headers=scrape_result.download_headers)
             for index, url in enumerate(scrape_result.image_urls)
         ]
         image_paths = await asyncio.gather(*image_tasks)
@@ -314,7 +316,7 @@ async def download_gallery(adapter: Adapter, task_info: DownloadTask) -> None:
                     new_record = models.DownloadRecord(
                         url=task_info.url,
                         status=task_info.status,
-                        title=scrape_result.title if "scrape_result" in locals() else "未知标题",
+                        title=scrape_result.title if scrape_result else "未知标题",
                         result_path=str(task_info.result_path) if task_info.result_path else None,
                         result_message=task_info.result_message,
                     )
@@ -333,59 +335,43 @@ async def download_gallery(adapter: Adapter, task_info: DownloadTask) -> None:
         task_info.finished_event.set()
 
 
-async def download_image(url: str, save_dir: Path, index: int) -> Path | None:
-    """下载单张图片."""
+# 重构 download_image 函数，使其更简单、更可靠
+async def download_image(
+    url: str, save_dir: Path, index: int, headers: dict | None = None
+) -> Path | None:
+    """下载单张图片.
 
-    async def _try_download(target_url: str) -> httpx.Response | None:
-        """一个内部的、尝试下载的辅助函数."""
-        try:
-            referer = (
-                "https://nhentai.net/" if "nhentai.net" in target_url else "https://e-hentai.org/"
-            )
-            if "pixiv.net" in target_url:
-                referer = "https://www.pixiv.net/"
+    Args:
+        url (str): 要下载的图片的精确 URL.
+        save_dir (Path): 保存目录.
+        index (int): 图片序号，用于命名.
+        headers (dict | None, optional): 下载时使用的请求头. Defaults to None.
 
-            resp = await scraper.client.get(target_url, headers={"Referer": referer})
-
-            # 只有在遇到 404 时才返回 None 进行重试，其他错误直接抛出
-            if resp.status_code == 404:
-                logger.warning(f"尝试下载 {target_url} 失败 (404)，准备切换扩展名重试...")
-                return None
-
-            # 检查其他可能的错误
-            resp.raise_for_status()
-            return resp
-        except httpx.HTTPStatusError as e:
-            # 捕获除了 404 之外的 HTTP 错误
-            raise e
-        except Exception:
-            raise
-
+    Returns:
+        Path | None: 成功则返回文件路径，否则返回 None.
+    """
     try:
-        base_url, _ = url.rsplit(".", 1)
+        # 直接使用全局 scraper 的 client 进行下载，保持 User-Agent 和代理等设置一致
+        # 并传入从 scraper 获取的、针对特定网站的 headers (例如 Pixiv 的 Referer)
+        resp = await scraper.client.get(url, headers=headers)
+        resp.raise_for_status()
 
-        extensions_to_try = [".webp", ".jpg", ".png"]
-
-        response = None
-        final_url = None
-
-        for ext in extensions_to_try:
-            current_url = base_url + ext
-            response = await _try_download(current_url)
-            if response:
-                final_url = current_url
-                logger.success(f"成功命中正确链接: {final_url}")
-                break
-
-        if response is None or final_url is None:
-            raise FileNotFoundError("在尝试了 webp, jpg, png 所有扩展名后，依然无法找到图片。")
-
-        # 使用成功命中的 URL 来获取最终的扩展名
-        ext = Path(final_url).suffix
+        # 从原始、准确的 URL 中提取文件扩展名，不再进行猜测
+        ext = Path(url).suffix
+        if not ext:  # 如果URL碰巧没有扩展名，提供一个备用方案
+            content_type = resp.headers.get("content-type", "")
+            if "jpeg" in content_type or "jpg" in content_type:
+                ext = ".jpg"
+            elif "png" in content_type:
+                ext = ".png"
+            elif "webp" in content_type:
+                ext = ".webp"
+            else:
+                ext = ".jpg"  # 默认
 
         file_path = save_dir / f"{index:03d}{ext}"
         with open(file_path, "wb") as f:
-            f.write(response.content)
+            f.write(resp.content)
         return file_path
 
     except Exception as e:
