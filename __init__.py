@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-import httpx
 from sqlalchemy.orm import Session
 from src.adapters.base import Adapter
 from src.api import API_FAILED
@@ -166,45 +165,148 @@ async def _(bot: Bot) -> None:
 @on_shutdown
 async def _(_bot: Bot) -> None:
     """插件关闭时，优雅地关闭 Scraper 的客户端并取消任务."""
+    tasks_to_cancel = []
+    for task_info in download_tasks.values():
+        if task_info.task and not task_info.task.done():
+            task_info.task.cancel()
+            tasks_to_cancel.append(task_info.task)
+
+    if tasks_to_cancel:
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        logger.info(f"EhPreview 插件 ({__name__}) 后台下载任务已全部取消。")
+
     if scraper:
         await scraper.close()
         logger.info(f"EhPreview 插件 ({__name__}) 已关闭，Scraper 客户端已释放。")
 
-    for task_info in download_tasks.values():
-        if task_info.task and not task_info.task.done():
-            task_info.task.cancel()
-
 
 # --- 4. 核心响应器：精准捕获URL ---
 URL_PATTERN = re.compile("|".join(p.pattern for p in Scraper.SCRAPER_MAPPING), re.IGNORECASE)
-eh_matcher = on_regex(URL_PATTERN.pattern)
+RELOAD_PATTERN = rf"^\s*/reload\s+({URL_PATTERN.pattern})/?\s*$"
+URL_MESSAGE_PATTERN = rf"^(?!\s*/reload\b).*?({URL_PATTERN.pattern})"
+
+reload_matcher = on_regex(RELOAD_PATTERN, priority=8)
+eh_matcher = on_regex(URL_MESSAGE_PATTERN)
 
 
-@eh_matcher.handle()
-async def handle_gallery_url(adapter: Adapter, event: GroupMessageEvent, matched: re.Match) -> None:
-    """处理捕获到的画廊链接."""
-    # 在处理函数的一开始，检查 scraper 是否成功初始化
-    if not scraper:
-        logger.warning("Scraper 未初始化，EhPreview 插件无法处理请求。")
-        await adapter.send_message(
-            event.group_id,
-            "group",
-            Message()
-            .reply(event.message_id)
-            .text("呜... EhPreview 插件初始化失败了，请检查后台日志。"),
-        )
-        return
-
-    url = matched.group(0).strip()
+def _normalize_gallery_url(raw_url: str) -> str:
+    url = raw_url.strip()
     if "e-hentai.org" in url:
-        url = url.replace("e-hentai.org", "exhentai.org")
+        return url.replace("e-hentai.org", "exhentai.org")
+    return url
 
-    request = DownloadRequest(
+
+def _gallery_url_from_match(matched: re.Match) -> str:
+    return _normalize_gallery_url(matched.group(1))
+
+
+def _download_request_from_event(event: GroupMessageEvent) -> DownloadRequest:
+    return DownloadRequest(
         group_id=event.group_id,
         user_id=event.user_id,
         message_id=event.message_id,
         self_id=event.self_id,
     )
+
+
+async def _delete_download_dir(path: Path | None) -> None:
+    if not path or not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+        logger.info(f"已删除 EhPreview 下载目录: {path}")
+    except Exception as e:
+        logger.error(f"删除 EhPreview 下载目录 {path} 失败: {e}", exc_info=True)
+
+
+async def _clear_download_cache(url: str) -> None:
+    task_info = download_tasks.pop(url, None)
+    if task_info:
+        await _delete_download_dir(task_info.result_path)
+        if task_info.task and not task_info.task.done():
+            task_info.requests.clear()
+            task_info.status = "failed"
+            task_info.result_message = "任务已被 /reload 取代。"
+            task_info.task.cancel()
+            await asyncio.gather(task_info.task, return_exceptions=True)
+
+    try:
+        with database.SessionFactory() as session:
+            record = session.query(models.DownloadRecord).get(url)
+            if not record:
+                return
+
+            await _delete_download_dir(Path(record.result_path) if record.result_path else None)
+            session.delete(record)
+            session.commit()
+            logger.info(f"已清除 EhPreview 缓存记录: {url}")
+    except Exception as e:
+        logger.error(f"清除 EhPreview 缓存记录 {url} 时出错: {e}", exc_info=True)
+
+
+async def _start_download_task(
+    adapter: Adapter,
+    event: GroupMessageEvent,
+    url: str,
+    request: DownloadRequest,
+    queued_message: str,
+) -> None:
+    await adapter.send_message(
+        event.group_id,
+        "group",
+        Message().reply(event.message_id).text(queued_message),
+    )
+
+    task_info = DownloadTask(url=url, requests=[request])
+    download_tasks[url] = task_info
+
+    bg_task = asyncio.create_task(download_gallery(adapter, task_info))
+    task_info.task = bg_task
+    bg_task.add_done_callback(lambda t: logger.info(f"后台任务 {t.get_name()} 完成。"))
+
+
+async def _ensure_scraper_ready(adapter: Adapter, event: GroupMessageEvent) -> bool:
+    if scraper:
+        return True
+
+    logger.warning("Scraper 未初始化，EhPreview 插件无法处理请求。")
+    await adapter.send_message(
+        event.group_id,
+        "group",
+        Message()
+        .reply(event.message_id)
+        .text("呜... EhPreview 插件初始化失败了，请检查后台日志。"),
+    )
+    return False
+
+
+@reload_matcher.handle()
+async def handle_reload_gallery_url(adapter: Adapter, event: GroupMessageEvent, matched: re.Match) -> None:
+    """清除指定画廊缓存并重新下载。"""
+    if not await _ensure_scraper_ready(adapter, event):
+        return
+
+    url = _gallery_url_from_match(matched)
+    request = _download_request_from_event(event)
+
+    await _clear_download_cache(url)
+    await _start_download_task(
+        adapter,
+        event,
+        url,
+        request,
+        "已清除这个本子的缓存，正在重新下载。",
+    )
+
+
+@eh_matcher.handle()
+async def handle_gallery_url(adapter: Adapter, event: GroupMessageEvent, matched: re.Match) -> None:
+    """处理捕获到的画廊链接。"""
+    if not await _ensure_scraper_ready(adapter, event):
+        return
+
+    url = _gallery_url_from_match(matched)
+    request = _download_request_from_event(event)
 
     if url in download_tasks:
         task_info = download_tasks[url]
@@ -217,10 +319,11 @@ async def handle_gallery_url(adapter: Adapter, event: GroupMessageEvent, matched
                 "group",
                 Message()
                 .reply(event.message_id)
-                .text("这个本子已经在下载队列里啦，请稍等片刻哦~ (｡･ω･｡)ﾉ"),
+                .text("这个本子已经在下载队列里啦，请稍等片刻哦~"),
             )
             await task_info.finished_event.wait()
-        elif task_info.status == "success":
+
+        if task_info.status == "success":
             await adapter.send_message(
                 event.group_id,
                 "group",
@@ -235,20 +338,15 @@ async def handle_gallery_url(adapter: Adapter, event: GroupMessageEvent, matched
                 .reply(event.message_id)
                 .text(f"这个本子之前下载失败了欸... 原因: {task_info.result_message}"),
             )
-    else:
-        await adapter.send_message(
-            event.group_id,
-            "group",
-            Message()
-            .reply(event.message_id)
-            .text("收到！新的本子已加入下载队列，请不要重复发送哦~"),
-        )
-        task_info = DownloadTask(url=url, requests=[request])
-        download_tasks[url] = task_info
+        return
 
-        bg_task = asyncio.create_task(download_gallery(adapter, task_info))
-        task_info.task = bg_task
-        bg_task.add_done_callback(lambda t: logger.info(f"后台任务 {t.get_name()} 完成。"))
+    await _start_download_task(
+        adapter,
+        event,
+        url,
+        request,
+        "收到！新的本子已加入下载队列，请不要重复发送哦~",
+    )
 
 
 # --- 5. 下载与处理核心函数 ---

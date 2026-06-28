@@ -1,6 +1,7 @@
 # I:/github/DaY-Core/plugins_human/eh_preview/scrapers.py
 import asyncio
 import re
+from pathlib import Path
 from typing import Any, ClassVar, NamedTuple
 
 import httpx
@@ -32,6 +33,11 @@ EHENTAI_RE = re.compile(r"https?://e-hentai\.org/g/\d+/[\w-]+")
 EXHENTAI_RE = re.compile(r"https?://exhentai\.org/g/\d+/[\w-]+")
 NHENTAI_RE = re.compile(r"https?://nhentai\.(net|to)/g/\d+")
 PIXIV_RE = re.compile(r"https?://www\.pixiv\.net/artworks/\d+")
+
+NHENTAI_API_BASE = "https://nhentai.net/api/v2"
+NHENTAI_IMAGE_BASE = "https://i.nhentai.net"
+NHENTAI_GALLERY_ID_RE = re.compile(r"/g/(\d+)")
+NHENTAI_PAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 
 class Scraper:
@@ -174,26 +180,30 @@ class Scraper:
             ConnectionError: 如果请求失败或无法访问API.
         """
         logger.info(f"开始通过API爬取 N-Hentai: {url}")
-        match = re.search(r"/g/(\d+)", url)
+        match = NHENTAI_GALLERY_ID_RE.search(url)
         if not match:
             raise ValueError("无效的 N-Hentai URL。")
         album_id = match.group(1)
 
-        # 1. 直接请求不设防的 API 端点
-        api_url = f"https://nhentai.net/api/gallery/{album_id}"
+        # 1. 请求 v2 API 文档公开的 gallery 端点
+        api_url = f"{NHENTAI_API_BASE}/galleries/{album_id}"
         api_resp = await self.get(api_url)  # 这个请求不需要任何特殊的 header
         data = api_resp.json()
 
-        # 2. 从返回的 JSON 中提取“圣印”(media_id) 和标题
+        # 2. 从返回的 JSON 中提取标题
         title = data.get("title", {}).get("pretty", f"nhentai-{album_id}")
-        media_id = data["media_id"]
 
-        # 3. 用“圣印”和页面信息，自己拼接出每一张图片的真实URL
+        # 3. v2 API 直接返回每页图片路径，不再暴露旧版 images.pages[*].t 类型表。
         image_urls = []
-        for i, page in enumerate(data["images"]["pages"]):
-            ext = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}.get(page["t"], "jpg")
-            # 使用 i.nhentai.net 作为图片服务器域名
-            image_urls.append(f"https://i4.nhentai.net/galleries/{media_id}/{i + 1}.{ext}")
+        for page in data["pages"]:
+            path = page["path"]
+            ext = Path(path).suffix.lower()
+            if ext not in NHENTAI_PAGE_EXTENSIONS:
+                raise ValueError(f"nHentai API 返回了未知图片扩展名: {path}")
+            image_urls.append(f"{NHENTAI_IMAGE_BASE}/{path.lstrip('/')}")
+
+        if not image_urls:
+            raise ValueError(f"nHentai API 未返回任何页面图片: {album_id}")
 
         logger.success(f"通过API成功获取到 {len(image_urls)} 张图片链接！")
         return ScrapeResult(title=title, author=None, description=None, image_urls=image_urls)
@@ -236,7 +246,7 @@ class Scraper:
         desc_html = body.get("description", "")
         description = BeautifulSoup(desc_html, "html.parser").get_text("\n")
         image_urls = [page["urls"]["original"] for page in pages_data["body"]]
-        
+
         # --- 2. 在这里返回结果时，附加上下载图片所需的 Referer 头 ---
         return ScrapeResult(
             title=title,
